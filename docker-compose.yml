@@ -1,14 +1,16 @@
 services:
   rustio:
+    image: ${RUSTIO_IMAGE_NAME:-rustio-rustio}
     build:
       context: .
       dockerfile: Dockerfile.rustio
-    container_name: rustio
+    container_name: ${RUSTIO_CONTAINER_NAME:-rustio}
     environment:
-      - RUSTIO_ADDR=0.0.0.0:9000
-      - RUSTIO_DATA_DIR=/app/data
+      RUSTIO_ADDR: ${RUSTIO_ADDR:-0.0.0.0:9000}
+      RUSTIO_DATA_DIR: ${RUSTIO_DATA_DIR_CONTAINER:-/app/data}
+      RUSTIO_CONSOLE_DIST: /app/web/console/dist
     ports:
-      - "9000:9000"
+      - "${RUSTIO_HOST_PORT:-9000}:${RUSTIO_CONTAINER_PORT:-9000}"
     volumes:
-      - ./data:/app/data
-    restart: unless-stopped
+      - "${RUSTIO_DATA_DIR_HOST:-./data}:${RUSTIO_DATA_DIR_CONTAINER:-/app/data}"
+    restart: ${RUSTIO_RESTART_POLICY:-unless-stopped}
