@@ -11,6 +11,9 @@ RUSTIO_CONSOLE_DIST="${RUSTIO_CONSOLE_DIST:-$SCRIPT_DIR/web/console/dist}"
 RUSTIO_AUTO_MIRROR="${RUSTIO_AUTO_MIRROR:-1}"
 RUSTIO_USE_DOCKER_NODE_BUILD="${RUSTIO_USE_DOCKER_NODE_BUILD:-0}"
 RUSTIO_SKIP_WEB_BUILD="${RUSTIO_SKIP_WEB_BUILD:-0}"
+RUSTIO_FORCE_WEB_BUILD="${RUSTIO_FORCE_WEB_BUILD:-0}"
+
+DOCKER_API_COMPATIBILITY_PROBED=0
 
 CURL_RETRY_ARGS=(
   --proto '=https'
@@ -34,6 +37,30 @@ fail() {
   exit 1
 }
 
+usage() {
+  cat <<'EOF'
+用法: ./start-source.sh [选项]
+
+选项:
+  --addr <host:port>         指定监听地址，默认 0.0.0.0:9000
+  --data-dir <path>          指定数据目录
+  --console-dist <path>      指定前端静态目录
+  --skip-web-build           跳过前端构建，直接复用现有 dist
+  --force-web-build          强制重新构建前端
+  --docker-node-build        使用 Docker 构建前端
+  --no-mirror                禁用自动镜像加速
+  -h, --help                 显示帮助
+
+常用环境变量:
+  RUSTIO_ADDR
+  RUSTIO_DATA_DIR
+  RUSTIO_CONSOLE_DIST
+  RUSTIO_SKIP_WEB_BUILD=1
+  RUSTIO_FORCE_WEB_BUILD=1
+  RUSTIO_USE_DOCKER_NODE_BUILD=1
+EOF
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "未找到命令 $1，请先安装后重试。 / Command $1 not found, please install it first and retry."
 }
@@ -44,6 +71,61 @@ curl_https() {
 
 url_reachable() {
   curl --head --silent --output /dev/null --connect-timeout 3 --max-time 5 "$1"
+}
+
+resolve_path() {
+  local input_path="$1"
+
+  if [[ "$input_path" = /* ]]; then
+    printf '%s\n' "$input_path"
+  else
+    printf '%s\n' "$SCRIPT_DIR/$input_path"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --addr)
+        [[ $# -ge 2 ]] || fail "参数 --addr 缺少值。 / Missing value for --addr."
+        RUSTIO_ADDR="$2"
+        shift 2
+        ;;
+      --data-dir)
+        [[ $# -ge 2 ]] || fail "参数 --data-dir 缺少值。 / Missing value for --data-dir."
+        RUSTIO_DATA_DIR="$(resolve_path "$2")"
+        shift 2
+        ;;
+      --console-dist)
+        [[ $# -ge 2 ]] || fail "参数 --console-dist 缺少值。 / Missing value for --console-dist."
+        RUSTIO_CONSOLE_DIST="$(resolve_path "$2")"
+        shift 2
+        ;;
+      --skip-web-build)
+        RUSTIO_SKIP_WEB_BUILD=1
+        shift
+        ;;
+      --force-web-build)
+        RUSTIO_FORCE_WEB_BUILD=1
+        shift
+        ;;
+      --docker-node-build)
+        RUSTIO_USE_DOCKER_NODE_BUILD=1
+        shift
+        ;;
+      --no-mirror)
+        RUSTIO_AUTO_MIRROR=0
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "不支持的参数：$1 / Unsupported argument: $1"
+        ;;
+    esac
+  done
 }
 
 get_rust_toolchain_channel() {
@@ -80,9 +162,53 @@ node_runtime_ok() {
 }
 
 enable_docker_node_build() {
-  require_cmd docker
+  ensure_docker_ready
   RUSTIO_USE_DOCKER_NODE_BUILD=1
   log "检测到本机 Node.js 与系统运行库不兼容，改用 Docker 构建前端。"
+}
+
+probe_docker_api_compatibility() {
+  local probe_output=""
+  local probe_status=0
+  local supported_api_version=""
+
+  set +e
+  probe_output="$(docker version --format '{{.Server.APIVersion}}' 2>&1)"
+  probe_status=$?
+  set -e
+
+  if [[ $probe_status -eq 0 ]]; then
+    return 0
+  fi
+
+  supported_api_version="$(
+    printf '%s\n' "$probe_output" \
+      | sed -nE 's/.*Maximum supported API version is ([0-9.]+).*/\1/p' \
+      | head -n1
+  )"
+
+  if [[ -n "$supported_api_version" ]]; then
+    export DOCKER_API_VERSION="$supported_api_version"
+    log "检测到 Docker Daemon 最大 API 版本 ${supported_api_version}，已自动启用兼容模式。"
+    if docker version --format '{{.Server.APIVersion}}' >/dev/null 2>&1; then
+      return 0
+    fi
+    fail "自动切换 Docker API 兼容模式后仍无法连接 daemon。 / Failed to connect to Docker daemon after enabling compatibility mode."
+  fi
+
+  printf '%s\n' "$probe_output" >&2
+  fail "检测 Docker daemon 版本失败，请确认 Docker 已启动。 / Failed to detect Docker daemon API version; please ensure Docker is running."
+}
+
+ensure_docker_ready() {
+  require_cmd docker
+
+  if [[ "$DOCKER_API_COMPATIBILITY_PROBED" == "1" ]]; then
+    return
+  fi
+
+  probe_docker_api_compatibility
+  DOCKER_API_COMPATIBILITY_PROBED=1
 }
 
 configure_fast_mirrors() {
@@ -162,6 +288,7 @@ ensure_nvm_loaded() {
 ensure_node() {
   local node_major=""
   local glibc_version=""
+  local install_status=0
 
   configure_fast_mirrors
 
@@ -188,9 +315,28 @@ ensure_node() {
     ensure_nvm_loaded || fail "nvm 安装后加载失败。"
   fi
 
+  set +e
   nvm install 22
+  install_status=$?
+  set -e
+
+  if [[ $install_status -ne 0 ]]; then
+    log "nvm 安装 Node.js 失败，自动回退到 Docker 构建前端。"
+    enable_docker_node_build
+    return
+  fi
+
   nvm alias default 22 >/dev/null
+  set +e
   nvm use 22 >/dev/null
+  install_status=$?
+  set -e
+
+  if [[ $install_status -ne 0 ]]; then
+    log "Node.js 安装成功但运行环境不可用，自动回退到 Docker 构建前端。"
+    enable_docker_node_build
+    return
+  fi
 
   if node_runtime_ok; then
     log "Node.js 安装完成：$(node -v)"
@@ -231,7 +377,7 @@ build_console_locally() {
 }
 
 build_console_with_docker() {
-  require_cmd docker
+  ensure_docker_ready
   mkdir -p "$SCRIPT_DIR/.cache/npm"
   log "开始使用 Docker 构建控制台前端..."
 
@@ -244,20 +390,90 @@ build_console_with_docker() {
     sh -lc 'if [ -n "$RUSTIO_NPM_REGISTRY" ]; then npm ci --prefer-offline --no-audit --no-fund --registry "$RUSTIO_NPM_REGISTRY"; else npm ci --prefer-offline --no-audit --no-fund; fi && npm run build'
 }
 
+console_build_stamp() {
+  printf '%s\n' "$RUSTIO_CONSOLE_DIST/.rustio-build-stamp"
+}
+
+console_build_needed() {
+  local stamp_path=""
+  local console_root="$SCRIPT_DIR/web/console"
+  local watch_targets=(
+    "$console_root/package.json"
+    "$console_root/package-lock.json"
+    "$console_root/vite.config.ts"
+    "$console_root/tsconfig.json"
+    "$console_root/index.html"
+    "$console_root/src"
+    "$console_root/public"
+  )
+  local target=""
+
+  if [[ "$RUSTIO_FORCE_WEB_BUILD" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "$RUSTIO_CONSOLE_DIST" ]]; then
+    return 0
+  fi
+
+  stamp_path="$(console_build_stamp)"
+  if [[ ! -f "$stamp_path" ]]; then
+    return 0
+  fi
+
+  for target in "${watch_targets[@]}"; do
+    [[ -e "$target" ]] || continue
+    if [[ -d "$target" ]]; then
+      if find "$target" -type f -newer "$stamp_path" | grep -q .; then
+        return 0
+      fi
+    elif [[ "$target" -nt "$stamp_path" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+mark_console_build_complete() {
+  local stamp_path=""
+
+  mkdir -p "$RUSTIO_CONSOLE_DIST"
+  stamp_path="$(console_build_stamp)"
+  : > "$stamp_path"
+}
+
 build_console() {
+  local build_status=0
+
+  if ! console_build_needed; then
+    log "检测到前端静态资源已是最新，跳过构建。"
+    return
+  fi
+
   if [[ "$RUSTIO_USE_DOCKER_NODE_BUILD" == "1" ]]; then
     build_console_with_docker
   else
+    set +e
     build_console_locally
+    build_status=$?
+    set -e
+
+    if [[ $build_status -ne 0 ]]; then
+      log "本机构建前端失败，自动回退到 Docker 构建。"
+      enable_docker_node_build
+      build_console_with_docker
+    fi
   fi
 
+  mark_console_build_complete
   [[ -d "$RUSTIO_CONSOLE_DIST" ]] || fail "前端构建完成，但未找到静态目录：$RUSTIO_CONSOLE_DIST / Frontend build finished but dist directory was not found: $RUSTIO_CONSOLE_DIST"
 }
 
 build_backend() {
   log "开始构建后端..."
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL="${CARGO_REGISTRIES_CRATES_IO_PROTOCOL:-sparse}" \
-    cargo build --release -p rustio
+    cargo build --locked --release -p rustio
   [[ -x "$SCRIPT_DIR/target/release/rustio" ]] || fail "后端构建完成，但未找到可执行文件：$SCRIPT_DIR/target/release/rustio / Backend build finished but executable was not found: $SCRIPT_DIR/target/release/rustio"
 }
 
@@ -276,6 +492,7 @@ run_rustio() {
 }
 
 main() {
+  parse_args "$@"
   ensure_rust
 
   if [[ -f "$HOME/.cargo/env" ]]; then
