@@ -90,7 +90,7 @@ mod tests {
     };
 
     use chrono::{Duration, Utc};
-    use rustio_core::{AlertChannel, ConsoleSession, ReplicationBacklogItem};
+    use rustio_core::{AlertChannel, AuditEvent, ConsoleSession, ReplicationBacklogItem};
     use serde_json::json;
 
     use super::{AlertSmtpTransport, AppState, LocalCredential};
@@ -117,6 +117,49 @@ mod tests {
         assert_eq!(server, "smtp.example.com:587");
         assert_eq!(recipient, "ops@example.com");
         assert_eq!(transport, AlertSmtpTransport::StartTls);
+    }
+
+    #[test]
+    fn audit_pruning_keeps_latest_entries() {
+        let _guard = test_env_lock()
+            .lock()
+            .expect("env lock should be available");
+        std::env::set_var("RUSTIO_AUDIT_MAX_EVENTS", "100");
+
+        let mut audits = (0..105)
+            .map(|index| AuditEvent {
+                id: format!("audit-{index}"),
+                actor: "admin".to_string(),
+                action: "auth.refresh".to_string(),
+                resource: "session".to_string(),
+                outcome: "success".to_string(),
+                reason: None,
+                timestamp: Utc::now(),
+                details: json!({ "index": index }),
+            })
+            .collect::<Vec<_>>();
+
+        super::prune_audits_locked(&mut audits);
+
+        let ids = audits.into_iter().map(|entry| entry.id).collect::<Vec<_>>();
+        assert_eq!(ids.len(), 100);
+        assert_eq!(ids.first().map(String::as_str), Some("audit-5"));
+        assert_eq!(ids.last().map(String::as_str), Some("audit-104"));
+
+        std::env::remove_var("RUSTIO_AUDIT_MAX_EVENTS");
+    }
+
+    #[test]
+    fn memory_trim_idle_threshold_defaults_to_twelve_hours() {
+        let _guard = test_env_lock()
+            .lock()
+            .expect("env lock should be available");
+        std::env::remove_var("RUSTIO_MEMORY_TRIM_IDLE_SECONDS");
+
+        assert_eq!(
+            AppState::memory_trim_idle_threshold(),
+            std::time::Duration::from_secs(43_200)
+        );
     }
 
     #[test]
@@ -1016,6 +1059,24 @@ fn current_process_rss_bytes() -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn current_process_rss_bytes() -> Option<u64> {
     None
+}
+
+fn audit_max_events() -> usize {
+    std::env::var("RUSTIO_AUDIT_MAX_EVENTS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(2_048)
+        .clamp(100, 100_000)
+}
+
+fn prune_audits_locked(audits: &mut Vec<AuditEvent>) {
+    let max_events = audit_max_events();
+    if audits.len() <= max_events {
+        return;
+    }
+
+    let overflow = audits.len().saturating_sub(max_events);
+    audits.drain(0..overflow);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2150,18 +2211,19 @@ impl AppState {
         let now_ts = Utc::now().timestamp();
         let last_request_at = self.last_request_activity_at.load(Ordering::Relaxed);
         let last_trim_at = self.last_memory_trim_at.load(Ordering::Relaxed);
+        let current_rss_bytes = current_process_rss_bytes();
 
         if Self::should_trim_memory(
             last_request_at,
             last_trim_at,
             now_ts,
             Self::memory_trim_idle_threshold(),
-        ) && self.trim_memory("idle", None, now_ts)
+        ) && self.trim_memory("idle", current_rss_bytes, now_ts)
         {
             return;
         }
 
-        let Some(rss_bytes) = current_process_rss_bytes() else {
+        let Some(rss_bytes) = current_rss_bytes else {
             return;
         };
         let threshold_bytes = Self::memory_trim_rss_threshold_bytes();
@@ -2180,9 +2242,12 @@ impl AppState {
         let trimmed = trim_process_memory();
         if trimmed {
             self.last_memory_trim_at.store(now_ts, Ordering::Relaxed);
+            let rss_after_bytes = current_process_rss_bytes();
             info!(
                 reason,
-                rss_bytes = rss_bytes.unwrap_or_default(),
+                rss_bytes = rss_bytes.or(rss_after_bytes).unwrap_or_default(),
+                rss_before_bytes = rss_bytes.unwrap_or_default(),
+                rss_after_bytes = rss_after_bytes.unwrap_or_default(),
                 threshold_bytes = Self::memory_trim_rss_threshold_bytes(),
                 "RustIO 已执行内存回收 / RustIO memory trim executed"
             );
@@ -2210,7 +2275,11 @@ impl AppState {
             timestamp: Utc::now(),
             details,
         };
-        self.audits.write().await.push(event.clone());
+        {
+            let mut audits = self.audits.write().await;
+            audits.push(event.clone());
+            prune_audits_locked(&mut audits);
+        }
         self.push_event(
             "audit.appended",
             "audit-service",
@@ -2636,7 +2705,7 @@ impl AppState {
         let ms = std::env::var("RUSTIO_STORAGE_SCAN_INTERVAL_MS")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(15_000)
+            .unwrap_or(300_000)
             .clamp(500, 3_600_000);
         std::time::Duration::from_millis(ms)
     }
@@ -2648,6 +2717,69 @@ impl AppState {
             .unwrap_or(1_000)
             .clamp(100, 60_000);
         std::time::Duration::from_millis(ms)
+    }
+
+    fn memory_trim_enabled() -> bool {
+        std::env::var("RUSTIO_MEMORY_TRIM_ENABLED")
+            .map(|value| !(value.eq_ignore_ascii_case("false") || value == "0"))
+            .unwrap_or(true)
+    }
+
+    fn memory_trim_interval() -> std::time::Duration {
+        let secs = std::env::var("RUSTIO_MEMORY_TRIM_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(300)
+            .clamp(30, 86_400);
+        std::time::Duration::from_secs(secs)
+    }
+
+    fn memory_trim_idle_threshold() -> std::time::Duration {
+        let secs = std::env::var("RUSTIO_MEMORY_TRIM_IDLE_SECONDS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(43_200)
+            .clamp(30, 604_800);
+        std::time::Duration::from_secs(secs)
+    }
+
+    fn memory_trim_force_interval() -> std::time::Duration {
+        let secs = std::env::var("RUSTIO_MEMORY_TRIM_FORCE_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(7_200)
+            .clamp(300, 604_800);
+        std::time::Duration::from_secs(secs)
+    }
+
+    fn memory_trim_rss_threshold_bytes() -> u64 {
+        let mb = std::env::var("RUSTIO_MEMORY_TRIM_RSS_THRESHOLD_MB")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .unwrap_or(128)
+            .clamp(32, 65_536);
+        mb.saturating_mul(1024 * 1024)
+    }
+
+    fn should_trim_memory(
+        last_request_at: i64,
+        last_trim_at: i64,
+        now_ts: i64,
+        idle_threshold: std::time::Duration,
+    ) -> bool {
+        let idle_secs = idle_threshold.as_secs().min(i64::MAX as u64) as i64;
+        now_ts.saturating_sub(last_request_at) >= idle_secs && last_trim_at < last_request_at
+    }
+
+    fn should_force_trim_memory(
+        last_trim_at: i64,
+        now_ts: i64,
+        rss_bytes: u64,
+        threshold_bytes: u64,
+        min_interval: std::time::Duration,
+    ) -> bool {
+        let interval_secs = min_interval.as_secs().min(i64::MAX as u64) as i64;
+        rss_bytes >= threshold_bytes && now_ts.saturating_sub(last_trim_at) >= interval_secs
     }
 
     const REPLICATION_NON_RETRYABLE_PREFIX: &'static str = "__RUSTIO_NON_RETRYABLE__:";
@@ -8583,69 +8715,6 @@ impl AppState {
             .filter(|value| *value > 0)
             .unwrap_or(200);
         std::time::Duration::from_millis(millis)
-    }
-
-    fn memory_trim_enabled() -> bool {
-        std::env::var("RUSTIO_MEMORY_TRIM_ENABLED")
-            .map(|value| !(value.eq_ignore_ascii_case("false") || value == "0"))
-            .unwrap_or(true)
-    }
-
-    fn memory_trim_interval() -> std::time::Duration {
-        let secs = std::env::var("RUSTIO_MEMORY_TRIM_INTERVAL_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(300)
-            .clamp(30, 86_400);
-        std::time::Duration::from_secs(secs)
-    }
-
-    fn memory_trim_idle_threshold() -> std::time::Duration {
-        let secs = std::env::var("RUSTIO_MEMORY_TRIM_IDLE_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(900)
-            .clamp(30, 604_800);
-        std::time::Duration::from_secs(secs)
-    }
-
-    fn memory_trim_force_interval() -> std::time::Duration {
-        let secs = std::env::var("RUSTIO_MEMORY_TRIM_FORCE_INTERVAL_SECONDS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(7_200)
-            .clamp(300, 604_800);
-        std::time::Duration::from_secs(secs)
-    }
-
-    fn memory_trim_rss_threshold_bytes() -> u64 {
-        let mb = std::env::var("RUSTIO_MEMORY_TRIM_RSS_THRESHOLD_MB")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(128)
-            .clamp(32, 65_536);
-        mb.saturating_mul(1024 * 1024)
-    }
-
-    fn should_trim_memory(
-        last_request_at: i64,
-        last_trim_at: i64,
-        now_ts: i64,
-        idle_threshold: std::time::Duration,
-    ) -> bool {
-        let idle_secs = idle_threshold.as_secs().min(i64::MAX as u64) as i64;
-        now_ts.saturating_sub(last_request_at) >= idle_secs && last_trim_at < last_request_at
-    }
-
-    fn should_force_trim_memory(
-        last_trim_at: i64,
-        now_ts: i64,
-        rss_bytes: u64,
-        threshold_bytes: u64,
-        min_interval: std::time::Duration,
-    ) -> bool {
-        let interval_secs = min_interval.as_secs().min(i64::MAX as u64) as i64;
-        rss_bytes >= threshold_bytes && now_ts.saturating_sub(last_trim_at) >= interval_secs
     }
 
     fn managed_async_job_lease_interval() -> std::time::Duration {

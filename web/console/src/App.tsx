@@ -120,20 +120,36 @@ export default function App() {
   }, [buildSessionState, clearSession, persistSession]);
 
   useEffect(() => {
-    if (!session?.refreshToken || !session.expiresAt) {
+    if (typeof window === 'undefined') {
       return;
     }
 
-    const refreshAt =
-      new Date(session.expiresAt).getTime() - Date.now() - 60 * 1000;
-    const timer = window.setTimeout(() => {
-      void refreshSession();
-    }, Math.max(refreshAt, 0));
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== 'rustio_session') {
+        return;
+      }
 
-    return () => {
-      window.clearTimeout(timer);
+      if (!event.newValue) {
+        sessionRef.current = null;
+        setSession(null);
+        return;
+      }
+
+      try {
+        const next = JSON.parse(event.newValue) as SessionState;
+        sessionRef.current = next;
+        setSession(next);
+      } catch {
+        sessionRef.current = null;
+        setSession(null);
+      }
     };
-  }, [refreshSession, session?.expiresAt, session?.refreshToken]);
+
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
 
   const client = useMemo<ApiClient>(() => {
     if (!session?.token) return apiClient;
@@ -197,7 +213,7 @@ export default function App() {
 
     const interval = window.setInterval(() => {
       void syncCurrentSession();
-    }, 30 * 1000);
+    }, 10 * 60 * 1000);
 
     const handleFocus = () => {
       void syncCurrentSession();

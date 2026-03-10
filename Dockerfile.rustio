@@ -1,11 +1,10 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.94-bookworm AS rust-builder
+FROM rust:1.86-bookworm AS rust-builder
 WORKDIR /app
 
 COPY Cargo.toml ./
 COPY Cargo.lock ./
-COPY .cargo ./.cargo
 COPY crates ./crates
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -18,7 +17,7 @@ FROM node:22-alpine AS console-builder
 WORKDIR /app/web/console
 
 COPY web/console/package*.json ./
-RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci --prefer-offline --no-audit --no-fund
+RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 
 COPY web/console ./
 RUN npm run build
@@ -37,8 +36,10 @@ ENV RUSTIO_CONSOLE_DIST=/app/web/console/dist
 ENV MALLOC_ARENA_MAX=2
 ENV MALLOC_TRIM_THRESHOLD_=131072
 ENV RUSTIO_MEMORY_TRIM_INTERVAL_SECONDS=300
-ENV RUSTIO_MEMORY_TRIM_IDLE_SECONDS=900
+ENV RUSTIO_MEMORY_TRIM_IDLE_SECONDS=43200
 ENV RUSTIO_MEMORY_TRIM_FORCE_INTERVAL_SECONDS=7200
 ENV RUSTIO_MEMORY_TRIM_RSS_THRESHOLD_MB=128
+ENV RUSTIO_AUDIT_MAX_EVENTS=2048
+ENV RUSTIO_STORAGE_SCAN_INTERVAL_MS=300000
 
 ENTRYPOINT ["rustio"]
