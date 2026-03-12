@@ -1016,6 +1016,15 @@ fn derived_ec_shard_path(
     ))
 }
 
+async fn summarize_ec_shard_file(
+    path: &FsPath,
+    expected_size: usize,
+) -> std::io::Result<(u64, bool)> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let size = metadata.len();
+    Ok((size, size == expected_size as u64))
+}
+
 async fn build_system_storage_metrics(
     state: &Arc<AppState>,
     capacity_total_bytes: u64,
@@ -1115,14 +1124,11 @@ async fn build_system_storage_metrics(
                     if manifest_disks.insert(shard.disk_index) {
                         aggregate.manifests_total += 1;
                     }
-                    match tokio::fs::read(&shard.path).await {
-                        Ok(bytes) => {
+                    match summarize_ec_shard_file(&shard.path, manifest.shard_size).await {
+                        Ok((size, healthy)) => {
                             aggregate.shard_files += 1;
-                            aggregate.shard_bytes =
-                                aggregate.shard_bytes.saturating_add(bytes.len() as u64);
-                            let checksum_matches =
-                                shard.checksum.is_empty() || sha256_hex(&bytes) == shard.checksum;
-                            if bytes.len() == manifest.shard_size && checksum_matches {
+                            aggregate.shard_bytes = aggregate.shard_bytes.saturating_add(size);
+                            if healthy {
                                 aggregate.shard_healthy += 1;
                             } else {
                                 aggregate.shard_corrupted += 1;
@@ -1760,256 +1766,400 @@ fn render_prometheus_metrics(summary: &SystemMetricsSummary) -> String {
 
 async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSummary {
     let now = Utc::now();
-    let nodes = state.nodes.read().await.clone();
+    let expiring_threshold = now + Duration::hours(24);
     let tenants_total = state.tenants.read().await.len();
     let raft = state.metadata_raft_status().await;
-    let users = state.users.read().await.clone();
-    let groups = state.groups.read().await.clone();
-    let policies = state.policies.read().await.clone();
-    let replications = state.replications.read().await.clone();
-    let site_replications = state.site_replications.read().await.clone();
-    let replication_backlog = state.replication_backlog.read().await.clone();
-    let replication_checkpoints = state.replication_checkpoints.read().await.clone();
-    let alert_rules = state.alert_rules.read().await.clone();
-    let alert_channels = state.alert_channels.read().await.clone();
-    let alert_history = state.alert_history.read().await.clone();
-    let alert_delivery_queue = state.alert_delivery_queue.read().await.clone();
-    let security = state.security.read().await.clone();
-    let audits = state.audits.read().await.clone();
-    let jobs = state.jobs.read().await.clone();
-    let object_meta = state.object_meta.read().await.clone();
-    let bucket_object_locks = state.bucket_object_locks.read().await.clone();
-    let bucket_retentions = state.bucket_retentions.read().await.clone();
-    let bucket_legal_holds = state.bucket_legal_holds.read().await.clone();
-    let governance_state = state.storage_governance.read().await.clone();
-    let service_accounts = state.service_accounts.read().await.clone();
-    let admin_sessions = state.admin_sessions.read().await.clone();
-    let sts_sessions = state.sts_sessions.read().await.clone();
-    let async_jobs = collect_async_jobs(state).await;
-    let async_summary = summarize_async_jobs(&async_jobs);
 
-    let total_nodes = nodes.len();
-    let online_nodes = nodes.iter().filter(|node| node.online).count();
-    let offline_nodes = total_nodes.saturating_sub(online_nodes);
-    let zones_total = nodes
-        .iter()
-        .map(|node| node.zone.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-    let capacity_total_bytes = nodes
-        .iter()
-        .map(|node| node.capacity_total_bytes)
-        .fold(0u64, u64::saturating_add);
-    let capacity_used_bytes = nodes
-        .iter()
-        .map(|node| node.capacity_used_bytes)
-        .fold(0u64, u64::saturating_add);
+    let (
+        total_nodes,
+        online_nodes,
+        offline_nodes,
+        zones_total,
+        capacity_total_bytes,
+        capacity_used_bytes,
+    ) = {
+        let nodes = state.nodes.read().await;
+        let total_nodes = nodes.len();
+        let online_nodes = nodes.iter().filter(|node| node.online).count();
+        let offline_nodes = total_nodes.saturating_sub(online_nodes);
+        let zones_total = nodes
+            .iter()
+            .map(|node| node.zone.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let capacity_total_bytes = nodes
+            .iter()
+            .map(|node| node.capacity_total_bytes)
+            .fold(0u64, u64::saturating_add);
+        let capacity_used_bytes = nodes
+            .iter()
+            .map(|node| node.capacity_used_bytes)
+            .fold(0u64, u64::saturating_add);
+        (
+            total_nodes,
+            online_nodes,
+            offline_nodes,
+            zones_total,
+            capacity_total_bytes,
+            capacity_used_bytes,
+        )
+    };
     let mut storage =
         build_system_storage_metrics(state, capacity_total_bytes, capacity_used_bytes).await;
 
-    let backlog_metrics = compute_replication_backlog_metrics(
-        &replication_backlog,
-        &alert_history,
-        &site_replications,
-        &ReplicationBacklogQuery::default(),
-        None,
-        now,
-    );
-    let site_replication_map = site_replications
-        .iter()
-        .cloned()
-        .map(|site| (site.site_id.clone(), site))
-        .collect::<HashMap<_, _>>();
-    let replication_sites = backlog_metrics
-        .sites
-        .iter()
-        .map(|site| {
-            let runtime = site_replication_map.get(&site.site_id);
-            SystemReplicationSiteMetricsSummary {
-                site_id: site.site_id.clone(),
-                endpoint: runtime.map(|site| site.endpoint.clone()),
-                state: runtime
-                    .map(|site| site.state.clone())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                lag_seconds: runtime.map(|site| site.lag_seconds).unwrap_or_default(),
-                backlog_total: site.total,
-                backlog_pending: site.pending,
-                backlog_failed: site.failed,
-                backlog_dead_letter: site.dead_letter,
-                backlog_sla_status: site.sla_status.clone(),
-                firing_alerts: site.firing_alerts,
+    let replications_total = state.replications.read().await.len();
+    let replication_checkpoints_total = state.replication_checkpoints.read().await.len();
+    let alert_rules_total = state.alert_rules.read().await.len();
+    let (channels_total, channels_enabled, channels_healthy) = {
+        let alert_channels = state.alert_channels.read().await;
+        (
+            alert_channels.len(),
+            alert_channels
+                .iter()
+                .filter(|channel| channel.enabled)
+                .count(),
+            alert_channels
+                .iter()
+                .filter(|channel| channel.enabled && channel.status == "healthy")
+                .count(),
+        )
+    };
+    let (
+        backlog_metrics,
+        replication_sites,
+        sites_healthy,
+        max_lag_seconds,
+        firing_alerts,
+        alert_history_total,
+    ) = {
+        let site_replications = state.site_replications.read().await;
+        let replication_backlog = state.replication_backlog.read().await;
+        let alert_history = state.alert_history.read().await;
+        let backlog_metrics = compute_replication_backlog_metrics(
+            &replication_backlog,
+            &alert_history,
+            &site_replications,
+            &ReplicationBacklogQuery::default(),
+            None,
+            now,
+        );
+        let site_replication_map = site_replications
+            .iter()
+            .map(|site| (site.site_id.as_str(), site))
+            .collect::<HashMap<_, _>>();
+        let replication_sites = backlog_metrics
+            .sites
+            .iter()
+            .map(|site| {
+                let runtime = site_replication_map.get(site.site_id.as_str()).copied();
+                SystemReplicationSiteMetricsSummary {
+                    site_id: site.site_id.clone(),
+                    endpoint: runtime.map(|site| site.endpoint.clone()),
+                    state: runtime
+                        .map(|site| site.state.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    lag_seconds: runtime.map(|site| site.lag_seconds).unwrap_or_default(),
+                    backlog_total: site.total,
+                    backlog_pending: site.pending,
+                    backlog_failed: site.failed,
+                    backlog_dead_letter: site.dead_letter,
+                    backlog_sla_status: site.sla_status.clone(),
+                    firing_alerts: site.firing_alerts,
+                }
+            })
+            .collect::<Vec<_>>();
+        let sites_healthy = replication_sites
+            .iter()
+            .filter(|site| site.state == "healthy")
+            .count();
+        let max_lag_seconds = replication_sites
+            .iter()
+            .map(|site| site.lag_seconds)
+            .max()
+            .unwrap_or_default();
+        (
+            backlog_metrics,
+            replication_sites,
+            sites_healthy,
+            max_lag_seconds,
+            count_firing_alerts(&alert_history),
+            alert_history.len(),
+        )
+    };
+    let (
+        delivery_queued,
+        delivery_in_progress,
+        delivery_failed,
+        delivery_done,
+        last_delivery_error,
+    ) = {
+        let alert_delivery_queue = state.alert_delivery_queue.read().await;
+        (
+            alert_delivery_queue
+                .iter()
+                .filter(|item| item.status == "pending")
+                .count(),
+            alert_delivery_queue
+                .iter()
+                .filter(|item| item.status == "in_progress")
+                .count(),
+            alert_delivery_queue
+                .iter()
+                .filter(|item| matches!(item.status.as_str(), "failed" | "dead_letter"))
+                .count(),
+            alert_delivery_queue
+                .iter()
+                .filter(|item| item.status == "done")
+                .count(),
+            latest_alert_delivery_error(&alert_delivery_queue),
+        )
+    };
+    let (users_total, users_enabled) = {
+        let users = state.users.read().await;
+        (
+            users.len(),
+            users.iter().filter(|user| user.enabled).count(),
+        )
+    };
+    let groups_total = state.groups.read().await.len();
+    let policies_total = state.policies.read().await.len();
+    let (service_accounts_total, service_accounts_enabled) = {
+        let service_accounts = state.service_accounts.read().await;
+        (
+            service_accounts.len(),
+            service_accounts
+                .iter()
+                .filter(|account| account.status == "enabled")
+                .count(),
+        )
+    };
+    let (admin_sessions_total, admin_sessions_active, admin_sessions_expiring_24h) = {
+        let admin_sessions = state.admin_sessions.read().await;
+        (
+            admin_sessions.len(),
+            admin_sessions
+                .iter()
+                .filter(|session| session.status == "active" && session.access_expires_at > now)
+                .count(),
+            admin_sessions
+                .iter()
+                .filter(|session| {
+                    session.status == "active"
+                        && session.access_expires_at > now
+                        && session.access_expires_at <= expiring_threshold
+                })
+                .count(),
+        )
+    };
+    let (sts_sessions_total, sts_sessions_active, sts_sessions_expiring_24h) = {
+        let sts_sessions = state.sts_sessions.read().await;
+        (
+            sts_sessions.len(),
+            sts_sessions
+                .iter()
+                .filter(|session| session.status == "active" && session.expires_at > now)
+                .count(),
+            sts_sessions
+                .iter()
+                .filter(|session| {
+                    session.status == "active"
+                        && session.expires_at > now
+                        && session.expires_at <= expiring_threshold
+                })
+                .count(),
+        )
+    };
+    let (
+        events_total,
+        auth_events_total,
+        iam_events_total,
+        kms_events_total,
+        alert_events_total,
+        replication_events_total,
+        job_events_total,
+        failed_outcomes_total,
+        latest_audit_event_at,
+    ) = {
+        let audits = state.audits.read().await;
+        let mut auth_events_total = 0usize;
+        let mut iam_events_total = 0usize;
+        let mut kms_events_total = 0usize;
+        let mut alert_events_total = 0usize;
+        let mut replication_events_total = 0usize;
+        let mut job_events_total = 0usize;
+        let mut failed_outcomes_total = 0usize;
+        let mut latest_audit_event_at = None;
+        for event in audits.iter() {
+            match audit_category(&event.action) {
+                "auth" => auth_events_total += 1,
+                "iam" => iam_events_total += 1,
+                "kms" => kms_events_total += 1,
+                "alerts" => alert_events_total += 1,
+                "replication" => replication_events_total += 1,
+                "jobs" => job_events_total += 1,
+                _ => {}
             }
-        })
-        .collect::<Vec<_>>();
-    let sites_healthy = replication_sites
-        .iter()
-        .filter(|site| site.state == "healthy")
-        .count();
-    let max_lag_seconds = replication_sites
-        .iter()
-        .map(|site| site.lag_seconds)
-        .max()
-        .unwrap_or_default();
-
-    let firing_alerts = count_firing_alerts(&alert_history);
-    let channels_enabled = alert_channels
-        .iter()
-        .filter(|channel| channel.enabled)
-        .count();
-    let channels_healthy = alert_channels
-        .iter()
-        .filter(|channel| channel.enabled && channel.status == "healthy")
-        .count();
-    let delivery_queued = alert_delivery_queue
-        .iter()
-        .filter(|item| item.status == "pending")
-        .count();
-    let delivery_in_progress = alert_delivery_queue
-        .iter()
-        .filter(|item| item.status == "in_progress")
-        .count();
-    let delivery_failed = alert_delivery_queue
-        .iter()
-        .filter(|item| matches!(item.status.as_str(), "failed" | "dead_letter"))
-        .count();
-    let delivery_done = alert_delivery_queue
-        .iter()
-        .filter(|item| item.status == "done")
-        .count();
-    let last_delivery_error = latest_alert_delivery_error(&alert_delivery_queue);
-
-    let users_enabled = users.iter().filter(|user| user.enabled).count();
-    let service_accounts_enabled = service_accounts
-        .iter()
-        .filter(|account| account.status == "enabled")
-        .count();
-    let admin_sessions_active = admin_sessions
-        .iter()
-        .filter(|session| session.status == "active" && session.access_expires_at > now)
-        .count();
-    let admin_sessions_expiring_24h = admin_sessions
-        .iter()
-        .filter(|session| {
-            session.status == "active"
-                && session.access_expires_at > now
-                && session.access_expires_at <= now + Duration::hours(24)
-        })
-        .count();
-    let sts_sessions_active = sts_sessions
-        .iter()
-        .filter(|session| session.status == "active" && session.expires_at > now)
-        .count();
-    let sts_sessions_expiring_24h = sts_sessions
-        .iter()
-        .filter(|session| {
-            session.status == "active"
-                && session.expires_at > now
-                && session.expires_at <= now + Duration::hours(24)
-        })
-        .count();
-
-    let auth_events_total = audits
-        .iter()
-        .filter(|event| audit_category(&event.action) == "auth")
-        .count();
-    let iam_events_total = audits
-        .iter()
-        .filter(|event| audit_category(&event.action) == "iam")
-        .count();
-    let kms_events_total = audits
-        .iter()
-        .filter(|event| audit_category(&event.action) == "kms")
-        .count();
-    let alert_events_total = audits
-        .iter()
-        .filter(|event| audit_category(&event.action) == "alerts")
-        .count();
-    let replication_events_total = audits
-        .iter()
-        .filter(|event| audit_category(&event.action) == "replication")
-        .count();
-    let job_events_total = audits
-        .iter()
-        .filter(|event| audit_category(&event.action) == "jobs")
-        .count();
-    let failed_outcomes_total = audits
-        .iter()
-        .filter(|event| event.outcome != "success")
-        .count();
-    let latest_audit_event_at = audits.iter().map(|event| event.timestamp).max();
-
-    let mut running_jobs = 0usize;
-    let mut pending_jobs = 0usize;
-    let mut completed_jobs = 0usize;
-    let mut failed_jobs = 0usize;
-    let mut cancelled_jobs = 0usize;
-    let mut idle_jobs = 0usize;
-    let mut other_jobs = 0usize;
-    let mut retrying_jobs = 0usize;
-    let mut scan_jobs = 0usize;
-    let mut scrub_jobs = 0usize;
-    let mut heal_jobs = 0usize;
-    let mut rebuild_jobs = 0usize;
-    for job in &jobs {
-        match job.status.as_str() {
-            "running" => running_jobs += 1,
-            "pending" | "queued" => pending_jobs += 1,
-            "completed" | "done" => completed_jobs += 1,
-            "failed" => failed_jobs += 1,
-            "cancelled" => cancelled_jobs += 1,
-            "idle" => idle_jobs += 1,
-            "retrying" => retrying_jobs += 1,
-            _ => other_jobs += 1,
+            if event.outcome != "success" {
+                failed_outcomes_total += 1;
+            }
+            latest_audit_event_at = latest_audit_event_at.max(Some(event.timestamp));
         }
-        match storage_job_kind_label(&job.kind) {
-            "scan" => scan_jobs += 1,
-            "scrub" => scrub_jobs += 1,
-            "heal" => heal_jobs += 1,
-            "rebuild" => rebuild_jobs += 1,
-            _ => {}
-        }
-    }
+        (
+            audits.len(),
+            auth_events_total,
+            iam_events_total,
+            kms_events_total,
+            alert_events_total,
+            replication_events_total,
+            job_events_total,
+            failed_outcomes_total,
+            latest_audit_event_at,
+        )
+    };
+    let (
+        jobs_total,
+        running_jobs,
+        pending_jobs,
+        completed_jobs,
+        failed_jobs,
+        cancelled_jobs,
+        idle_jobs,
+        other_jobs,
+        retrying_jobs,
+        scan_jobs,
+        scrub_jobs,
+        heal_jobs,
+        rebuild_jobs,
+        pending_storage_objects,
+        running_storage_objects,
+        failed_storage_objects,
+        retrying_storage_objects,
+        disk_pressure,
+        async_summary,
+    ) = {
+        let jobs = state.jobs.read().await;
+        let replication_backlog = state.replication_backlog.read().await;
+        let alert_delivery_queue = state.alert_delivery_queue.read().await;
+        let async_summary =
+            summarize_async_job_sources(&jobs, &replication_backlog, &alert_delivery_queue);
+        let mut running_jobs = 0usize;
+        let mut pending_jobs = 0usize;
+        let mut completed_jobs = 0usize;
+        let mut failed_jobs = 0usize;
+        let mut cancelled_jobs = 0usize;
+        let mut idle_jobs = 0usize;
+        let mut other_jobs = 0usize;
+        let mut retrying_jobs = 0usize;
+        let mut scan_jobs = 0usize;
+        let mut scrub_jobs = 0usize;
+        let mut heal_jobs = 0usize;
+        let mut rebuild_jobs = 0usize;
+        let mut pending_storage_objects = 0usize;
+        let mut running_storage_objects = 0usize;
+        let mut failed_storage_objects = 0usize;
+        let mut retrying_storage_objects = 0usize;
+        let mut disk_pressure = HashMap::<String, usize>::new();
 
-    let pending_storage_objects = jobs
-        .iter()
-        .filter(|job| {
-            storage_job_is_storage_work(storage_job_kind_label(&job.kind))
-                && job.status == "pending"
-        })
-        .count();
-    let running_storage_objects = jobs
-        .iter()
-        .filter(|job| {
-            storage_job_is_storage_work(storage_job_kind_label(&job.kind))
-                && job.status == "running"
-        })
-        .count();
-    let failed_storage_objects = jobs
-        .iter()
-        .filter(|job| {
-            storage_job_is_storage_work(storage_job_kind_label(&job.kind)) && job.status == "failed"
-        })
-        .count();
-    let retrying_storage_objects = jobs
-        .iter()
-        .filter(|job| {
-            storage_job_is_storage_work(storage_job_kind_label(&job.kind))
-                && job.status == "retrying"
-        })
-        .count();
+        for job in jobs.iter() {
+            match job.status.as_str() {
+                "running" => running_jobs += 1,
+                "pending" | "queued" => pending_jobs += 1,
+                "completed" | "done" => completed_jobs += 1,
+                "failed" => failed_jobs += 1,
+                "cancelled" => cancelled_jobs += 1,
+                "idle" => idle_jobs += 1,
+                "retrying" => retrying_jobs += 1,
+                _ => other_jobs += 1,
+            }
 
-    let mut disk_pressure = HashMap::<String, usize>::new();
-    for job in &jobs {
-        if !matches!(job.status.as_str(), "pending" | "running" | "retrying") {
-            continue;
+            let storage_kind = storage_job_kind_label(&job.kind);
+            match storage_kind {
+                "scan" => scan_jobs += 1,
+                "scrub" => scrub_jobs += 1,
+                "heal" => heal_jobs += 1,
+                "rebuild" => rebuild_jobs += 1,
+                _ => {}
+            }
+
+            if !storage_job_is_storage_work(storage_kind) {
+                continue;
+            }
+
+            match job.status.as_str() {
+                "pending" => pending_storage_objects += 1,
+                "running" => running_storage_objects += 1,
+                "failed" => failed_storage_objects += 1,
+                "retrying" => retrying_storage_objects += 1,
+                _ => {}
+            }
+
+            if !matches!(job.status.as_str(), "pending" | "running" | "retrying") {
+                continue;
+            }
+
+            for disk in &job.affected_disks {
+                *disk_pressure.entry(disk.clone()).or_default() += 1;
+            }
         }
-        if !storage_job_is_storage_work(storage_job_kind_label(&job.kind)) {
-            continue;
-        }
-        for disk in &job.affected_disks {
-            *disk_pressure.entry(disk.clone()).or_default() += 1;
-        }
-    }
+
+        (
+            jobs.len(),
+            running_jobs,
+            pending_jobs,
+            completed_jobs,
+            failed_jobs,
+            cancelled_jobs,
+            idle_jobs,
+            other_jobs,
+            retrying_jobs,
+            scan_jobs,
+            scrub_jobs,
+            heal_jobs,
+            rebuild_jobs,
+            pending_storage_objects,
+            running_storage_objects,
+            failed_storage_objects,
+            retrying_storage_objects,
+            disk_pressure,
+            async_summary,
+        )
+    };
+    let (object_lock_buckets, retention_buckets, legal_hold_buckets) = {
+        let bucket_object_locks = state.bucket_object_locks.read().await;
+        let bucket_retentions = state.bucket_retentions.read().await;
+        let bucket_legal_holds = state.bucket_legal_holds.read().await;
+        (
+            bucket_object_locks
+                .values()
+                .filter(|item| item.enabled)
+                .count(),
+            bucket_retentions
+                .values()
+                .filter(|item| item.enabled)
+                .count(),
+            bucket_legal_holds
+                .values()
+                .filter(|item| item.enabled)
+                .count(),
+        )
+    };
+    let (retained_objects, legal_hold_objects) = {
+        let object_meta = state.object_meta.read().await;
+        (
+            object_meta
+                .values()
+                .filter(|item| {
+                    item.retention_until
+                        .map(|until| until > now)
+                        .unwrap_or(false)
+                })
+                .count(),
+            object_meta.values().filter(|item| item.legal_hold).count(),
+        )
+    };
+    let governance_state = state.storage_governance.read().await.clone();
+    let security = state.security.read().await.clone();
+
     for disk in &mut storage.disks {
         disk.heal_pressure = *disk_pressure.get(&disk.disk_id).unwrap_or(&0);
         disk.last_anomaly_at = governance_state
@@ -2048,27 +2198,11 @@ async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSum
         decommission_failures_total: governance_state.decommission_failures_total,
         draining_disks: governance_state.draining_disks.len(),
         decommissioned_disks: governance_state.decommissioned_disks.len(),
-        object_lock_buckets: bucket_object_locks
-            .values()
-            .filter(|item| item.enabled)
-            .count(),
-        retention_buckets: bucket_retentions
-            .values()
-            .filter(|item| item.enabled)
-            .count(),
-        legal_hold_buckets: bucket_legal_holds
-            .values()
-            .filter(|item| item.enabled)
-            .count(),
-        retained_objects: object_meta
-            .values()
-            .filter(|item| {
-                item.retention_until
-                    .map(|until| until > now)
-                    .unwrap_or(false)
-            })
-            .count(),
-        legal_hold_objects: object_meta.values().filter(|item| item.legal_hold).count(),
+        object_lock_buckets,
+        retention_buckets,
+        legal_hold_buckets,
+        retained_objects,
+        legal_hold_objects,
     };
 
     SystemMetricsSummary {
@@ -2095,10 +2229,10 @@ async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSum
             last_error: raft.last_error,
         },
         replication: SystemReplicationMetricsSummary {
-            rules_total: replications.len(),
+            rules_total: replications_total,
             sites_total: replication_sites.len(),
             sites_healthy,
-            checkpoints_total: replication_checkpoints.len(),
+            checkpoints_total: replication_checkpoints_total,
             max_lag_seconds,
             backlog_total: backlog_metrics.total,
             backlog_pending: backlog_metrics.pending,
@@ -2114,12 +2248,12 @@ async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSum
             sites: replication_sites,
         },
         alerts: SystemAlertMetricsSummary {
-            rules_total: alert_rules.len(),
-            channels_total: alert_channels.len(),
+            rules_total: alert_rules_total,
+            channels_total,
             channels_enabled,
             channels_healthy,
             firing_alerts,
-            history_total: alert_history.len(),
+            history_total: alert_history_total,
             delivery_queued,
             delivery_in_progress,
             delivery_failed,
@@ -2127,15 +2261,15 @@ async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSum
             last_delivery_error,
         },
         iam: SystemIamMetricsSummary {
-            users_total: users.len(),
+            users_total,
             users_enabled,
-            groups_total: groups.len(),
-            policies_total: policies.len(),
-            service_accounts_total: service_accounts.len(),
+            groups_total,
+            policies_total,
+            service_accounts_total,
             service_accounts_enabled,
         },
         audit: SystemAuditMetricsSummary {
-            events_total: audits.len(),
+            events_total,
             auth_events_total,
             iam_events_total,
             kms_events_total,
@@ -2154,7 +2288,7 @@ async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSum
             sse_mode: security.sse_mode,
         },
         jobs: SystemJobMetricsSummary {
-            total: jobs.len(),
+            total: jobs_total,
             running: running_jobs,
             pending: pending_jobs,
             completed: completed_jobs,
@@ -2190,12 +2324,12 @@ async fn build_system_metrics_summary(state: &Arc<AppState>) -> SystemMetricsSum
                 .collect(),
         },
         sessions: SystemSessionMetricsSummary {
-            service_accounts_total: service_accounts.len(),
+            service_accounts_total,
             service_accounts_enabled,
-            admin_sessions_total: admin_sessions.len(),
+            admin_sessions_total,
             admin_sessions_active,
             admin_sessions_expiring_24h,
-            sts_sessions_total: sts_sessions.len(),
+            sts_sessions_total,
             sts_sessions_active,
             sts_sessions_expiring_24h,
         },
@@ -6117,6 +6251,7 @@ async fn delete_tenant(
 }
 
 const SUPPORT_BUNDLE_FORMAT_VERSION: &str = "support-bundle.v1";
+const INCIDENT_PACK_FORMAT_VERSION: &str = "incident-pack.v1";
 
 fn default_true() -> bool {
     true
@@ -6142,6 +6277,79 @@ fn support_bundle_sections() -> Vec<String> {
     .collect()
 }
 
+fn incident_pack_sections() -> Vec<String> {
+    let mut sections = support_bundle_sections();
+    sections.extend(
+        [
+            "incident_summary",
+            "triage_flow",
+            "restore_playbook",
+            "runbook_catalog",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    sections
+}
+
+fn normalize_diagnostic_kind(value: Option<&str>) -> Result<String, AppError> {
+    match value
+        .map(|item| item.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("") | Some("support-bundle") | Some("support_bundle") | Some("support") => {
+            Ok("support-bundle".to_string())
+        }
+        Some("incident-pack") | Some("incident_pack") | Some("incident") => {
+            Ok("incident-pack".to_string())
+        }
+        Some(other) => Err(AppError::bad_request(format!(
+            "诊断包类型不支持：{other} / unsupported diagnostic kind: {other}"
+        ))),
+    }
+}
+
+fn normalize_incident_severity(value: Option<&str>) -> String {
+    value
+        .and_then(|item| {
+            let trimmed = item.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_ascii_uppercase())
+        })
+        .unwrap_or_else(|| "P1".to_string())
+}
+
+fn diagnostic_format_version(kind: &str) -> &'static str {
+    match kind {
+        "incident-pack" => INCIDENT_PACK_FORMAT_VERSION,
+        _ => SUPPORT_BUNDLE_FORMAT_VERSION,
+    }
+}
+
+fn diagnostic_sections(kind: &str) -> Vec<String> {
+    match kind {
+        "incident-pack" => incident_pack_sections(),
+        _ => support_bundle_sections(),
+    }
+}
+
+fn support_bundle_summary() -> String {
+    "离线支持包：配置、Raft、复制、KMS、审计与任务快照 / offline support bundle: config, raft, replication, kms, audit and jobs snapshot".to_string()
+}
+
+fn diagnostic_summary(kind: &str, query: &CreateDiagnosticQuery) -> String {
+    match kind {
+        "incident-pack" => {
+            let summary = normalize_optional_text(query.incident_summary.clone())
+                .unwrap_or_else(|| "待补充事件摘要 / incident summary pending".to_string());
+            format!(
+                "事件处置包：{} / incident response pack: {}",
+                summary, summary
+            )
+        }
+        _ => support_bundle_summary(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateDiagnosticQuery {
     #[serde(default = "default_true")]
@@ -6152,6 +6360,14 @@ struct CreateDiagnosticQuery {
     job_limit: usize,
     #[serde(default = "default_diagnostic_limit")]
     backlog_limit: usize,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    incident_id: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    incident_summary: Option<String>,
 }
 
 fn support_bundle_dir(state: &AppState) -> PathBuf {
@@ -6164,6 +6380,166 @@ fn support_bundle_path(state: &AppState, report_id: &str) -> PathBuf {
 
 fn support_bundle_download_name(report_id: &str) -> String {
     format!("rustio-support-bundle-{report_id}.json")
+}
+
+fn diagnostic_download_name(kind: &str, report_id: &str) -> String {
+    match kind {
+        "incident-pack" => format!("rustio-incident-pack-{report_id}.json"),
+        _ => support_bundle_download_name(report_id),
+    }
+}
+
+fn incident_pack_runbook_catalog() -> Vec<Value> {
+    vec![
+        json!({
+            "title": "事件处置总览 / incident response overview",
+            "path": "docs/operations/incident-runbook.md",
+            "purpose": "统一查看值班分流、诊断包生成与恢复步骤 / central runbook for triage, diagnostic pack generation and recovery"
+        }),
+        json!({
+            "title": "升级与回滚基线 / upgrade and rollback baseline",
+            "path": "docs/operations/upgrade-rollback.md",
+            "purpose": "升级失败时的 Helm 与元数据回滚 / Helm and metadata rollback during failed upgrades"
+        }),
+        json!({
+            "title": "远端层生产矩阵 / remote tier production matrix",
+            "path": "docs/storage/remote-tier-production-matrix.md",
+            "purpose": "远端 tier backend 的兼容矩阵、样例配置与 smoke 入口 / backend compatibility matrix, samples and smoke entrypoints"
+        }),
+        json!({
+            "title": "发布工程与兼容矩阵 / release engineering and compatibility matrix",
+            "path": "docs/release/compatibility-matrix.md",
+            "purpose": "版本矩阵、交付物与发布约束 / version matrix, release artifacts and constraints"
+        }),
+    ]
+}
+
+fn incident_pack_triage_flow() -> Vec<Value> {
+    vec![
+        json!({
+            "step": 1,
+            "title": "确认服务与集群健康 / confirm service and cluster health",
+            "checks": ["/health/live", "/health/ready", "/health/cluster", "/api/v1/system/metrics/summary"],
+            "when_to_escalate": "健康检查持续失败超过 5 分钟 / health checks fail continuously for more than 5 minutes"
+        }),
+        json!({
+            "step": 2,
+            "title": "确认 Raft 与复制状态 / inspect raft and replication state",
+            "checks": ["/api/v1/system/raft/status", "/api/v1/replication/sites", "/api/v1/jobs/replication-backlog/metrics"],
+            "when_to_escalate": "leader 丢失、复制 backlog 持续增长或 failover 卡住 / leader is missing, replication backlog keeps growing, or failover is stuck"
+        }),
+        json!({
+            "step": 3,
+            "title": "确认 KMS、远端层与任务面 / inspect kms, remote tiers and jobs",
+            "checks": ["/api/v1/security/kms/status", "/api/v1/storage/tiers", "/api/v1/jobs/async/summary"],
+            "when_to_escalate": "KMS rotate 连续失败、tier 退化或 async worker 队列阻塞 / repeated KMS rotate failures, degraded remote tiers, or blocked async workers"
+        }),
+        json!({
+            "step": 4,
+            "title": "决定回滚还是修复 / decide rollback versus live remediation",
+            "checks": ["/api/v1/cluster/backup/export", "/api/v1/cluster/backup/restore"],
+            "when_to_escalate": "数据面已受损或控制面配置不可恢复 / data plane is impaired or control plane configuration cannot be safely recovered"
+        }),
+    ]
+}
+
+fn incident_pack_restore_playbook() -> Vec<Value> {
+    vec![
+        json!({
+            "step": 1,
+            "title": "冻结变更并导出现状 / freeze changes and export current state",
+            "action": "先导出当前 cluster backup 与 Helm values，避免二次覆盖 / export current cluster backup and Helm values before making further changes",
+            "commands": [
+                "GET /api/v1/cluster/backup/export",
+                "helm get values rustio -n rustio -o yaml"
+            ]
+        }),
+        json!({
+            "step": 2,
+            "title": "回滚部署物 / rollback deployment assets",
+            "action": "若故障与发布相关，优先执行镜像或 Helm 回滚 / rollback image or Helm release first when the incident is release-related",
+            "commands": [
+                "helm history rustio -n rustio",
+                "helm rollback rustio <REVISION> -n rustio"
+            ]
+        }),
+        json!({
+            "step": 3,
+            "title": "恢复控制面元数据 / restore control-plane metadata",
+            "action": "必要时使用 cluster backup restore 恢复元数据与远端 tier 快照 / use cluster backup restore to recover metadata and remote tier snapshots when required",
+            "commands": [
+                "POST /api/v1/cluster/backup/restore"
+            ]
+        }),
+        json!({
+            "step": 4,
+            "title": "执行收尾验证 / run post-restore validation",
+            "action": "校验健康检查、metrics、raft、replication、tier 与 KMS 状态 / validate health, metrics, raft, replication, tiers and KMS after restore",
+            "commands": [
+                "/health/ready",
+                "/api/v1/system/metrics/summary",
+                "/api/v1/system/raft/status",
+                "/api/v1/storage/tiers",
+                "/api/v1/security/kms/status"
+            ]
+        }),
+    ]
+}
+
+fn append_incident_pack_sections(
+    bundle: &mut Value,
+    report: &rustio_core::DiagnosticReport,
+    query: &CreateDiagnosticQuery,
+) {
+    let Some(sections) = bundle.get_mut("sections").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let incident_id = normalize_optional_text(query.incident_id.clone())
+        .unwrap_or_else(|| format!("INCIDENT-{}", report.id.to_ascii_uppercase()));
+    let incident_summary = normalize_optional_text(query.incident_summary.clone())
+        .unwrap_or_else(|| "待补充事件摘要 / incident summary pending".to_string());
+    let severity = normalize_incident_severity(query.severity.as_deref());
+    let cluster_status = sections
+        .get("system_metrics")
+        .and_then(|value| value.get("cluster_status"))
+        .cloned()
+        .unwrap_or_else(|| json!("unknown"));
+    let kms_provider = sections
+        .get("kms_status")
+        .and_then(|value| value.get("provider"))
+        .cloned()
+        .unwrap_or_else(|| json!("local"));
+    let backlog_status_counts = sections
+        .get("replication")
+        .and_then(|value| value.get("backlog_status_counts"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    sections.insert(
+        "incident_summary".to_string(),
+        json!({
+            "incident_id": incident_id,
+            "severity": severity,
+            "summary": incident_summary,
+            "generated_at": report.created_at,
+            "generated_by": report.generated_by,
+            "cluster_status": cluster_status,
+            "kms_provider": kms_provider,
+            "replication_backlog_status_counts": backlog_status_counts,
+            "first_response_slo": "15 分钟内完成首轮分流 / complete first triage within 15 minutes",
+        }),
+    );
+    sections.insert(
+        "triage_flow".to_string(),
+        Value::Array(incident_pack_triage_flow()),
+    );
+    sections.insert(
+        "restore_playbook".to_string(),
+        Value::Array(incident_pack_restore_playbook()),
+    );
+    sections.insert(
+        "runbook_catalog".to_string(),
+        Value::Array(incident_pack_runbook_catalog()),
+    );
 }
 
 fn diagnostic_sensitive_key(key: &str) -> bool {
@@ -6417,7 +6793,7 @@ async fn build_support_bundle_document(
     }
 
     let mut bundle = json!({
-        "format_version": SUPPORT_BUNDLE_FORMAT_VERSION,
+        "format_version": report.format,
         "generated_at": report.created_at,
         "offline_ready": true,
         "redacted": report.redacted,
@@ -6447,6 +6823,10 @@ async fn build_support_bundle_document(
         }
     });
 
+    if report.kind == "incident-pack" {
+        append_incident_pack_sections(&mut bundle, report, query);
+    }
+
     if query.redact_sensitive {
         redact_support_bundle_value(&mut bundle);
     }
@@ -6467,19 +6847,20 @@ async fn create_diagnostic(
     Query(query): Query<CreateDiagnosticQuery>,
 ) -> Result<Json<ApiEnvelope<rustio_core::DiagnosticReport>>, AppError> {
     auth.require(Permission::ClusterWrite)?;
+    let kind = normalize_diagnostic_kind(query.kind.as_deref())?;
     let report = rustio_core::DiagnosticReport {
         id: Uuid::new_v4().to_string(),
         created_at: Utc::now(),
         generated_by: auth.username.clone(),
-        summary: "离线支持包：配置、Raft、复制、KMS、审计与任务快照 / offline support bundle: config, raft, replication, kms, audit and jobs snapshot".to_string(),
-        kind: "support-bundle".to_string(),
-        format: SUPPORT_BUNDLE_FORMAT_VERSION.to_string(),
+        summary: diagnostic_summary(&kind, &query),
+        kind: kind.clone(),
+        format: diagnostic_format_version(&kind).to_string(),
         redacted: query.redact_sensitive,
-        sections: support_bundle_sections(),
-        download_name: Some(support_bundle_download_name("pending")),
+        sections: diagnostic_sections(&kind),
+        download_name: Some(diagnostic_download_name(&kind, "pending")),
     };
     let mut report = report;
-    report.download_name = Some(support_bundle_download_name(&report.id));
+    report.download_name = Some(diagnostic_download_name(&kind, &report.id));
 
     let bundle = build_support_bundle_document(&state, &report, &query).await?;
     persist_support_bundle(state.as_ref(), &report.id, &bundle).await?;
@@ -6527,17 +6908,21 @@ async fn download_diagnostic(
     Path(id): Path<String>,
 ) -> Result<Response, AppError> {
     auth.require(Permission::ClusterRead)?;
-    let payload = serde_json::to_vec_pretty(&read_support_bundle(state.as_ref(), &id).await?)
-        .map_err(|err| {
-            AppError::internal(format!(
-                "序列化支持包下载失败 / failed to serialize support bundle download: {err}"
-            ))
-        })?;
+    let bundle = read_support_bundle(state.as_ref(), &id).await?;
+    let payload = serde_json::to_vec_pretty(&bundle).map_err(|err| {
+        AppError::internal(format!(
+            "序列化支持包下载失败 / failed to serialize support bundle download: {err}"
+        ))
+    })?;
     let mut response = payload.into_response();
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let download_name = support_bundle_download_name(&id);
+    let download_name = bundle
+        .pointer("/report/download_name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| support_bundle_download_name(&id));
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
         HeaderValue::from_str(&format!("attachment; filename=\"{download_name}\"")).map_err(
@@ -17438,6 +17823,120 @@ fn filter_async_jobs(
     Ok(items)
 }
 
+fn record_async_job_summary(
+    summary: &mut AsyncJobSummary,
+    by_kind: &mut HashMap<String, AsyncJobKindSummary>,
+    kind: &str,
+    status: &str,
+    retryable: bool,
+) {
+    let entry = by_kind
+        .entry(kind.to_string())
+        .or_insert_with(|| AsyncJobKindSummary {
+            kind: kind.to_string(),
+            total: 0,
+            pending: 0,
+            in_progress: 0,
+            completed: 0,
+            failed: 0,
+            dead_letter: 0,
+            retryable: 0,
+        });
+    entry.total += 1;
+    if retryable {
+        summary.retryable += 1;
+        entry.retryable += 1;
+    }
+    match status {
+        "pending" | "queued" => {
+            summary.pending += 1;
+            entry.pending += 1;
+        }
+        "in_progress" | "running" => {
+            summary.in_progress += 1;
+            entry.in_progress += 1;
+        }
+        "done" | "completed" | "success" | "skipped" => {
+            summary.completed += 1;
+            entry.completed += 1;
+        }
+        "partial_failed" | "failed" => {
+            summary.failed += 1;
+            entry.failed += 1;
+        }
+        "dead_letter" => {
+            summary.dead_letter += 1;
+            entry.dead_letter += 1;
+        }
+        _ => {}
+    }
+}
+
+fn finalize_async_job_summary(
+    mut summary: AsyncJobSummary,
+    by_kind: HashMap<String, AsyncJobKindSummary>,
+) -> AsyncJobSummary {
+    summary.kinds = by_kind.into_values().collect::<Vec<_>>();
+    summary
+        .kinds
+        .sort_by(|left, right| left.kind.cmp(&right.kind));
+    summary
+}
+
+fn summarize_async_job_sources(
+    jobs: &[JobStatus],
+    replication_backlog: &[ReplicationBacklogItem],
+    alert_delivery_queue: &[AlertDeliveryItem],
+) -> AsyncJobSummary {
+    let mut by_kind = HashMap::<String, AsyncJobKindSummary>::new();
+    let mut summary = AsyncJobSummary {
+        generated_at: Utc::now(),
+        total: replication_backlog.len()
+            + alert_delivery_queue.len()
+            + jobs.iter().filter(|job| job.status != "idle").count(),
+        pending: 0,
+        in_progress: 0,
+        completed: 0,
+        failed: 0,
+        dead_letter: 0,
+        retryable: 0,
+        kinds: Vec::new(),
+    };
+
+    for item in replication_backlog {
+        let kind = "replication";
+        record_async_job_summary(
+            &mut summary,
+            &mut by_kind,
+            kind,
+            &item.status,
+            async_job_retryable(kind, &item.status),
+        );
+    }
+
+    for item in alert_delivery_queue {
+        let kind = "notification";
+        record_async_job_summary(
+            &mut summary,
+            &mut by_kind,
+            kind,
+            &item.status,
+            async_job_retryable(kind, &item.status),
+        );
+    }
+
+    for job in jobs {
+        if job.status == "idle" {
+            continue;
+        }
+        let kind = normalize_async_job_kind(&job.kind);
+        let retryable = async_job_retryable(&kind, &job.status);
+        record_async_job_summary(&mut summary, &mut by_kind, &kind, &job.status, retryable);
+    }
+
+    finalize_async_job_summary(summary, by_kind)
+}
+
 fn summarize_async_jobs(items: &[AsyncJobStatus]) -> AsyncJobSummary {
     let mut by_kind = HashMap::<String, AsyncJobKindSummary>::new();
     let mut summary = AsyncJobSummary {
@@ -17453,58 +17952,15 @@ fn summarize_async_jobs(items: &[AsyncJobStatus]) -> AsyncJobSummary {
     };
 
     for item in items {
-        let kind = item.kind.clone();
-        let entry = by_kind
-            .entry(kind.clone())
-            .or_insert_with(|| AsyncJobKindSummary {
-                kind,
-                total: 0,
-                pending: 0,
-                in_progress: 0,
-                completed: 0,
-                failed: 0,
-                dead_letter: 0,
-                retryable: 0,
-            });
-        entry.total += 1;
-        if item.retryable {
-            summary.retryable += 1;
-            entry.retryable += 1;
-        }
-        match item.status.as_str() {
-            "pending" | "queued" => {
-                summary.pending += 1;
-                entry.pending += 1;
-            }
-            "in_progress" | "running" => {
-                summary.in_progress += 1;
-                entry.in_progress += 1;
-            }
-            "done" | "completed" | "success" | "skipped" => {
-                summary.completed += 1;
-                entry.completed += 1;
-            }
-            "partial_failed" => {
-                summary.failed += 1;
-                entry.failed += 1;
-            }
-            "dead_letter" => {
-                summary.dead_letter += 1;
-                entry.dead_letter += 1;
-            }
-            "failed" => {
-                summary.failed += 1;
-                entry.failed += 1;
-            }
-            _ => {}
-        }
+        record_async_job_summary(
+            &mut summary,
+            &mut by_kind,
+            &item.kind,
+            &item.status,
+            item.retryable,
+        );
     }
-
-    summary.kinds = by_kind.into_values().collect::<Vec<_>>();
-    summary
-        .kinds
-        .sort_by(|left, right| left.kind.cmp(&right.kind));
-    summary
+    finalize_async_job_summary(summary, by_kind)
 }
 
 async fn list_async_jobs(
@@ -18930,7 +19386,7 @@ async fn inspect_storage_manifest(
         }
     }
 
-    let current_meta = read_current_object_meta(state, bucket, &manifest.key)
+    let current_meta = read_current_object_meta_from_disk(state, bucket, &manifest.key)
         .await
         .ok()
         .flatten();
@@ -33008,6 +33464,22 @@ async fn read_current_object_meta(
         return Ok(Some(meta));
     }
 
+    let Some(meta) = read_current_object_meta_from_disk(state, bucket, key).await? else {
+        return Ok(None);
+    };
+    state
+        .object_meta
+        .write()
+        .await
+        .insert((bucket.to_string(), key.to_string()), meta.clone());
+    Ok(Some(meta))
+}
+
+async fn read_current_object_meta_from_disk(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<S3ObjectMeta>, Response> {
     let bucket_root = bucket_path(state, bucket)?;
     let meta_path = object_meta_path(&bucket_root, key)?;
     let bytes = match tokio::fs::read(&meta_path).await {
@@ -33031,11 +33503,6 @@ async fn read_current_object_meta(
             key,
         )
     })?;
-    state
-        .object_meta
-        .write()
-        .await
-        .insert((bucket.to_string(), key.to_string()), meta.clone());
     Ok(Some(meta))
 }
 
@@ -33981,6 +34448,94 @@ mod tier_and_tenant_compat_tests {
                 .expect("project alias should resolve"),
             "tenant-a"
         );
+    }
+}
+
+#[cfg(test)]
+mod object_meta_cache_tests {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    use chrono::Utc;
+    use rustio_core::{S3ObjectEncryptionMeta, S3ObjectMeta};
+    use uuid::Uuid;
+
+    use crate::state::AppState;
+
+    use super::{object_meta_path, read_current_object_meta, read_current_object_meta_from_disk};
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn background_meta_read_does_not_warm_object_meta_cache() {
+        let _guard = test_env_lock()
+            .lock()
+            .expect("env lock should be available");
+        let temp_dir = std::env::temp_dir().join(format!("rustio-object-meta-{}", Uuid::new_v4()));
+        let bucket = "reports";
+        let bucket_dir = temp_dir.join(bucket);
+        std::fs::create_dir_all(&bucket_dir).expect("bucket dir should be created");
+
+        let previous_data_dir = std::env::var("RUSTIO_DATA_DIR").ok();
+        std::env::set_var("RUSTIO_DATA_DIR", &temp_dir);
+
+        let meta = S3ObjectMeta {
+            bucket: bucket.to_string(),
+            key: "daily/summary.json".to_string(),
+            version_id: "v1".to_string(),
+            size: 128,
+            etag: "etag-1".to_string(),
+            created_at: Utc::now(),
+            storage_class: "STANDARD".to_string(),
+            retention_mode: None,
+            retention_until: None,
+            legal_hold: false,
+            delete_marker: false,
+            remote_tier: None,
+            restore: None,
+            tags: Vec::new(),
+            user_metadata: HashMap::new(),
+            encryption: S3ObjectEncryptionMeta::default(),
+        };
+        let meta_path =
+            object_meta_path(&bucket_dir, &meta.key).expect("object meta path should build");
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).expect("meta dir should be created");
+        }
+        std::fs::write(
+            &meta_path,
+            serde_json::to_vec(&meta).expect("meta bytes should serialize"),
+        )
+        .expect("meta file should be written");
+
+        let state = AppState::bootstrap();
+        assert!(state.object_meta.read().await.is_empty());
+
+        let disk_meta = read_current_object_meta_from_disk(state.as_ref(), bucket, &meta.key)
+            .await
+            .expect("disk read should succeed")
+            .expect("meta should exist on disk");
+        assert_eq!(disk_meta.version_id, meta.version_id);
+        assert!(state.object_meta.read().await.is_empty());
+
+        let cached_meta = read_current_object_meta(state.as_ref(), bucket, &meta.key)
+            .await
+            .expect("cached read should succeed")
+            .expect("meta should be cached");
+        assert_eq!(cached_meta.version_id, meta.version_id);
+        assert_eq!(state.object_meta.read().await.len(), 1);
+
+        if let Some(value) = previous_data_dir {
+            std::env::set_var("RUSTIO_DATA_DIR", value);
+        } else {
+            std::env::remove_var("RUSTIO_DATA_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
