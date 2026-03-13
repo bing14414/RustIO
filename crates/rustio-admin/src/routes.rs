@@ -8877,8 +8877,8 @@ async fn delete_bucket_spec(
         return Err(AppError::not_found("存储桶不存在 / bucket not found"));
     }
 
-    let has_objects =
-        bucket_has_objects(&bucket_dir).map_err(|err| AppError::internal(err.to_string()))?;
+    let has_objects = bucket_has_objects(&bucket_dir, &bucket_dir)
+        .map_err(|err| AppError::internal(err.to_string()))?;
     if has_objects {
         return Err(AppError::bad_request("存储桶非空 / bucket is not empty"));
     }
@@ -23392,7 +23392,7 @@ async fn s3_root_delete_bucket(
         );
     }
 
-    let has_objects = match bucket_has_objects(&bucket_dir) {
+    let has_objects = match bucket_has_objects(&bucket_dir, &bucket_dir) {
         Ok(value) => value,
         Err(err) => {
             return s3_error(
@@ -33750,15 +33750,37 @@ fn collect_object_meta_entries(
     Ok(())
 }
 
-fn bucket_has_objects(dir: &FsPath) -> std::io::Result<bool> {
+fn is_bucket_control_plane_metadata_path(bucket_root: &FsPath, path: &FsPath) -> bool {
+    let rel = path
+        .strip_prefix(bucket_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    matches!(
+        rel.as_str(),
+        ".rustio_meta/bucket-policy.json"
+            | ".rustio_meta/bucket-lifecycle.json"
+            | ".rustio_meta/bucket-notifications.json"
+            | ".rustio_meta/bucket-acl.json"
+            | ".rustio_meta/bucket-public-access-block.json"
+            | ".rustio_meta/bucket-cors.json"
+            | ".rustio_meta/bucket-tags.json"
+            | ".rustio_meta/bucket-encryption.json"
+    )
+}
+
+fn bucket_has_objects(bucket_root: &FsPath, dir: &FsPath) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let metadata = entry.metadata()?;
+        if is_bucket_control_plane_metadata_path(bucket_root, &path) {
+            continue;
+        }
         if metadata.is_file() {
             return Ok(true);
         }
-        if metadata.is_dir() && bucket_has_objects(&path)? {
+        if metadata.is_dir() && bucket_has_objects(bucket_root, &path)? {
             return Ok(true);
         }
     }
@@ -34536,6 +34558,66 @@ mod object_meta_cache_tests {
             std::env::remove_var("RUSTIO_DATA_DIR");
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
+#[cfg(test)]
+mod bucket_has_objects_tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use uuid::Uuid;
+
+    use super::bucket_has_objects;
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn bucket_control_plane_metadata_does_not_make_bucket_non_empty() {
+        let _guard = test_env_lock()
+            .lock()
+            .expect("env lock should be available");
+        let bucket_dir =
+            std::env::temp_dir().join(format!("rustio-bucket-empty-check-{}", Uuid::new_v4()));
+        let meta_dir = bucket_dir.join(".rustio_meta");
+        std::fs::create_dir_all(&meta_dir).expect("bucket meta dir should be created");
+        std::fs::write(meta_dir.join("bucket-policy.json"), b"{}")
+            .expect("bucket policy metadata should be written");
+        std::fs::write(meta_dir.join("bucket-tags.json"), b"[]")
+            .expect("bucket tags metadata should be written");
+
+        let has_objects =
+            bucket_has_objects(&bucket_dir, &bucket_dir).expect("bucket emptiness check should work");
+        assert!(
+            !has_objects,
+            "bucket control-plane metadata should not block bucket deletion"
+        );
+
+        let _ = std::fs::remove_dir_all(&bucket_dir);
+    }
+
+    #[test]
+    fn archived_object_versions_still_make_bucket_non_empty() {
+        let _guard = test_env_lock()
+            .lock()
+            .expect("env lock should be available");
+        let bucket_dir = std::env::temp_dir()
+            .join(format!("rustio-bucket-version-check-{}", Uuid::new_v4()));
+        let version_dir = bucket_dir.join(".rustio_versions").join("docs").join("guide.txt");
+        std::fs::create_dir_all(&version_dir).expect("version dir should be created");
+        std::fs::write(version_dir.join("v1.json"), b"{}")
+            .expect("archived version metadata should be written");
+
+        let has_objects =
+            bucket_has_objects(&bucket_dir, &bucket_dir).expect("bucket emptiness check should work");
+        assert!(
+            has_objects,
+            "archived object versions should still block bucket deletion"
+        );
+
+        let _ = std::fs::remove_dir_all(&bucket_dir);
     }
 }
 
