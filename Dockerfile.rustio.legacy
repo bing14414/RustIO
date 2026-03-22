@@ -19,7 +19,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --locked --release -p rustio && \
+RUN cargo build --locked --release -p rustio -j 1 -vv && \
     cp /app/target/release/rustio /tmp/rustio
 
 FROM node:22-alpine AS console-builder
